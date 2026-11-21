@@ -17,7 +17,7 @@ const readline = createInterface({
 export default class AuthKeyz {
   url = "https://authkeyz.bond/api/1.3/"
   public_key =
-    ""
+    "8e8d104f3ce9b29b411cfcf8e049d19fed42e63caa275e111bfa71ef3d237041"
   loggingEnabled = true
 
   initialized = false
@@ -726,10 +726,48 @@ export default class AuthKeyz {
         return responseData
       }
 
-      const serverSig = response.headers.get("signature");
-      if (serverSig && serverSig !== "No encryption key supplied" && typeof crypto !== "undefined") {
-        // Native HMAC verification
+      const edSignature = response.headers.get("x-signature-ed25519")
+      const timestamp = response.headers.get("x-signature-timestamp")
+      if (edSignature && timestamp && this.public_key) {
+        const server_time = new Date(Number(timestamp) * 1000).toUTCString()
+        const current_time = new Date().toUTCString()
+
+        const buffer_seconds = 5
+        const time_difference =
+          Math.abs(
+            new Date(server_time).getTime() - new Date(current_time).getTime()
+          ) / 1000
+
+        if (time_difference > buffer_seconds + 300) {
+          console.log(
+            `Time difference is too large: ${time_difference} seconds, try syncing your date and time settings.`
+          )
+          this.sleep(5000)
+          process.exit(0)
+        }
+
+        if (
+          !verifyKey(
+            Buffer.from(JSON.stringify(responseData), "utf-8"),
+            edSignature,
+            timestamp,
+            this.public_key
+          )
+        ) {
+          console.log(
+            "Signature checksum failed. Request was tampered with or session ended most likely."
+          )
+          await this.sleep(3000)
+          process.exit(0)
+        }
+      } else {
+        const serverSig = response.headers.get("signature")
+        if (serverSig && serverSig !== "No encryption key supplied" && typeof crypto !== "undefined") {
+          // Native HMAC fallback
+        }
       }
+
+      this.logEvent(JSON.stringify(responseData) + "\n")
       return responseData
     } catch (error) {
       console.error("Unexpected error:", error)
