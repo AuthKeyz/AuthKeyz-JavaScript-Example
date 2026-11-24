@@ -5,6 +5,7 @@ import { verifyKey } from "discord-interactions"
 
 import os from "os"
 import fs from "fs"
+import dns from "dns"
 import crypto from "crypto"
 import * as QRCode from "qrcode"
 
@@ -619,17 +620,23 @@ export default class AuthKeyz {
       }
     } else if (platform === "win32") {
       try {
-        const winUser = os.userInfo().username
-        const sidOutput = execSync(
-          `wmic useraccount where name='${winUser}' get sid`
+        const csvOut = execSync("whoami /user /fo csv /nh", { stdio: ["ignore", "pipe", "ignore"] })
+          .toString()
+          .trim()
+        const sidMatch = csvOut.match(/"(S-1-[0-9-]+)"/)
+        if (sidMatch && sidMatch[1]) {
+          return sidMatch[1]
+        }
+        const psSid = execSync(
+          'powershell -NoProfile -Command "([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value"',
+          { stdio: ["ignore", "pipe", "ignore"] }
         )
           .toString()
-          .split("\n")
-        const sid = sidOutput[1]?.trim()
-        if (!sid) {
-          throw new Error("Failed to retrieve SID on Windows: SID is undefined")
+          .trim()
+        if (psSid) {
+          return psSid
         }
-        return sid
+        throw new Error("Failed to retrieve SID on Windows: SID is empty")
       } catch (error) {
         console.error("Error retrieving SID on Windows:", error)
         throw new Error("Failed to retrieve HWID on Windows")
@@ -661,7 +668,7 @@ export default class AuthKeyz {
       }
       const img = Buffer.from(base64Data, "base64")
 
-      const outputPath = this.path ?? "qrcode.png"
+      const outputPath = "qrcode.png"
       fs.writeFileSync(outputPath, img)
 
       const platform = os.platform()
@@ -690,9 +697,8 @@ export default class AuthKeyz {
 
   getCheckSum() {
     const md5Hash = crypto.createHash("md5")
-    const file = fs.readFileSync(process.argv.slice(2).join(""), {
-      encoding: "binary"
-    })
+    const targetFile = process.argv[1] || process.argv[0]
+    const file = fs.readFileSync(targetFile)
     md5Hash.update(file)
     const digest = md5Hash.digest("hex")
     return digest
@@ -703,8 +709,32 @@ export default class AuthKeyz {
     return new Promise(resolve => setTimeout(resolve, ms))
   }
 
+  async checkHostSpoofing() {
+    try {
+      const parsed = new URL(this.url)
+      const records = await dns.promises.lookup(parsed.hostname, { all: true })
+      for (const rec of records) {
+        const ip = rec.address
+        if (
+          ip === "127.0.0.1" ||
+          ip === "::1" ||
+          ip.startsWith("10.") ||
+          ip.startsWith("192.168.") ||
+          /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip)
+        ) {
+          console.error("Hosts file or local loopback interception detected.")
+          await this.sleep(3000)
+          process.exit(1)
+        }
+      }
+    } catch {
+      // Allow fetch to handle DNS failures
+    }
+  }
+
   async __do_request(data) {
     try {
+      await this.checkHostSpoofing()
       const response = await fetch(this.url, {
         method: "POST",
         headers: {
@@ -716,11 +746,12 @@ export default class AuthKeyz {
 
       if (!response.ok) {
         console.error(`HTTP error! Status: ${response.status}`)
-        this.sleep(5000)
+        await this.sleep(5000)
         process.exit(0)
       }
 
-      const responseData = await response.json()
+      const rawBody = await response.text()
+      const responseData = JSON.parse(rawBody)
       const dontRunExtra = ["log", "file", "2faenable", "2fadisable"]
       if (dontRunExtra.includes(data.type)) {
         return responseData
@@ -729,6 +760,11 @@ export default class AuthKeyz {
       const edSignature = response.headers.get("x-signature-ed25519")
       const timestamp = response.headers.get("x-signature-timestamp")
       if (edSignature && timestamp && this.public_key) {
+        if (!/^\d+$/.test(timestamp.trim())) {
+          console.log("Invalid signature timestamp format.")
+          await this.sleep(3000)
+          process.exit(0)
+        }
         const server_time = new Date(Number(timestamp) * 1000).toUTCString()
         const current_time = new Date().toUTCString()
 
@@ -742,13 +778,23 @@ export default class AuthKeyz {
           console.log(
             `Time difference is too large: ${time_difference} seconds, try syncing your date and time settings.`
           )
-          this.sleep(5000)
+          await this.sleep(5000)
+          process.exit(0)
+        }
+
+        if (!this.seenSignatures) {
+          this.seenSignatures = new Set()
+        }
+        const sigKey = `${timestamp}:${edSignature}`
+        if (this.seenSignatures.has(sigKey)) {
+          console.log("Replay attack detected: duplicate signature rejected.")
+          await this.sleep(3000)
           process.exit(0)
         }
 
         if (
           !verifyKey(
-            Buffer.from(JSON.stringify(responseData), "utf-8"),
+            Buffer.from(rawBody, "utf-8"),
             edSignature,
             timestamp,
             this.public_key
@@ -760,11 +806,18 @@ export default class AuthKeyz {
           await this.sleep(3000)
           process.exit(0)
         }
+        this.seenSignatures.add(sigKey)
       } else {
         const serverSig = response.headers.get("signature")
         if (serverSig && serverSig !== "No encryption key supplied" && typeof crypto !== "undefined") {
           // Native HMAC fallback
         }
+      }
+
+      if (responseData && responseData.ownerid && responseData.ownerid !== this.ownerid) {
+        console.log("Application ownerid mismatch detected.")
+        await this.sleep(3000)
+        process.exit(0)
       }
 
       this.logEvent(JSON.stringify(responseData) + "\n")
@@ -834,15 +887,18 @@ export default class AuthKeyz {
   }
 
   __load_user_data(data) {
+    const firstSub = Array.isArray(data["subscriptions"]) && data["subscriptions"].length > 0
+      ? data["subscriptions"][0]
+      : null
     this.user_data = {
       username: data["username"],
       ip: data["ip"],
       hwid: data["hwid"] || "N/A",
-      expires: data["subscriptions"][0]["expiry"],
+      expires: firstSub?.["expiry"] ?? 0,
       createdate: data["createdate"],
       lastlogin: data["lastlogin"],
-      subscription: data["subscriptions"][0]["subscription"],
-      subscriptions: data["subscriptions"]
+      subscription: firstSub?.["subscription"] ?? "N/A",
+      subscriptions: data["subscriptions"] ?? []
     }
   }
 }
